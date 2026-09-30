@@ -220,3 +220,30 @@ a.who:hover b { text-decoration: underline; }
   .map { height: 340px; }
   .bars { height: 180px; }
 }
+
+/* ---------- roles, magic links, refs, registrations */
+.chip.none { background: var(--soft); color: var(--muted); }
+.chip.role { background: var(--soft); color: var(--muted); margin-inline-start: 4px; }
+.chip.role.admin { background: color-mix(in srgb, var(--brand) 16%, transparent); color: var(--brand); }
+.chip.role.super { background: color-mix(in srgb, #f59e0b 20%, transparent); color: #b45309; }
+.me-box .chip.role { font-size: 11px; }
+.role-sel { padding: 4px 8px; font-size: 13px; }
+.badge { display: inline-block; min-width: 18px; padding: 0 5px; border-radius: 99px; background: #ef4444; color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; }
+
+.refs-panel { grid-column: 1 / -1; border-top: 1px solid var(--line); padding-top: 6px; }
+.refs-panel h3 { padding: 6px 0; }
+.tbl.compact td, .tbl.compact th { padding: 6px 10px; }
+.ref-add { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.ref-add input { flex: 1; min-width: 160px; padding: 6px 10px; }
+
+.link-box { padding: 4px 16px 16px; display: grid; gap: 10px; }
+.link-url { direction: ltr; text-align: left; background: var(--soft); border-radius: 10px; padding: 10px 12px; word-break: break-all; font-size: 14px; }
+.link-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.reg-status { padding: 4px 8px; font-size: 13px; font-weight: 500; }
+.reg-status.new { color: #dc2626; border-color: color-mix(in srgb, #dc2626 40%, transparent); }
+.reg-status.contacted { color: var(--temp); }
+.reg-status.joined { color: var(--ok); }
+.reg-status.rejected { color: var(--muted); }
+.reg-row.new td:first-child { box-shadow: inset -3px 0 0 #dc2626; }
+.reg-row.rejected td { opacity: .6; }

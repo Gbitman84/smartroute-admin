@@ -1,5 +1,5 @@
 import { createData, statsOf } from './data.js';
-import { ADMIN_EMAILS, APP } from './config.js';
+import { SUPERADMIN, APP, magicLink, registrationLink } from './config.js';
 import {
   $, el, esc, todayStr, addDays, parseDate, dayName, shortDate, longDate, periodRange, stepPeriod, periodLabel, eachDay,
   fmtTime, fmtStamp, fmtAgo, fmtDuration, fmtAddress, pct, initials, decodePolyline,
@@ -19,15 +19,33 @@ const PERIODS = [['day', 'יום'], ['week', 'שבוע'], ['month', 'חודש']]
 // ------------------------------------------------------------------ state
 const A = {
   data: null, me: null,
+  role: null,          // 'super' | 'admin' – only these two may use the panel
   app: APP,
-  users: [], access: {}, usersLoaded: false,
-  listeners: [],       // app-wide (users + access)
-  view: { id: 0, unsubs: [], maps: [], timer: null, onUsers: null },
+  users: [], usersLoaded: false,   // members merged with their app profiles
+  profiles: [], members: {}, membersLoaded: false,
+  invites: [], refs: {}, regs: [], regsLoaded: false,
+  listeners: [],       // app-wide (profiles, members, invites, refs, registrations)
+  view: { id: 0, unsubs: [], maps: [], timer: null, onUsers: null, onData: null },
   usersFilter: { q: '', show: 'all' },
+  regsFilter: { status: 'open', q: '' },
 };
 
-const isDisabled = (uid) => A.access[uid]?.disabled === true;
+const isSuper = () => A.role === 'super';
+const isDisabled = (uid) => A.members[uid]?.disabled === true;
+const roleOf = (uid) => (A.users.find((u) => u.id === uid)?.email === SUPERADMIN ? 'super' : A.members[uid]?.role === 'admin' ? 'admin' : A.members[uid] ? 'user' : 'none');
 const userById = (uid) => A.users.find((u) => u.id === uid);
+const nameOf = (uid) => (uid === 'superadmin' ? 'מנהל ראשי' : userById(uid)?.name || userById(uid)?.email || A.members[uid]?.name || '—');
+// Superadmin: anyone but themselves. Admin: regular users only (never admins / the superadmin / themselves).
+const canToggle = (uid) => uid !== A.me.uid && roleOf(uid) !== 'super' && (isSuper() || roleOf(uid) === 'user') && !!A.members[uid];
+const refOf = (ref) => A.refs[String(ref || '').trim().toLowerCase()] || null;
+
+async function copyText(text, msg = 'הועתק ✓') {
+  try { await navigator.clipboard.writeText(text); toast(msg); }
+  catch { window.prompt('העתק:', text); }
+}
+// 050-1234567 → https://wa.me/972501234567?text=…
+const waLink = (mobile, text) => `https://wa.me/${mobile ? '972' + String(mobile).replace(/\D/g, '').replace(/^0/, '') : ''}?text=${encodeURIComponent(text)}`;
+const inviteText = (url, name) => `היי${name ? ' ' + name : ''}! 👋\nזה הקישור שלך להצטרפות ל-SmartRoute – סידור מסלול משלוחים חכם:\n${url}\nנכנסים עם חשבון Google וזהו.`;
 const done = (s) => (s?.delivered || 0) + (s?.noAnswer || 0);
 const left = (s) => (s?.pending || 0) + (s?.temp || 0);
 
@@ -47,9 +65,10 @@ function explainError(e) {
 }
 
 // ------------------------------------------------------------------ dialog
-function dialog({ title, body, okText = 'אישור', danger = false, note = null }) {
+function dialog({ title, body, okText = 'אישור', danger = false, note = null, value = '' }) {
   return new Promise((resolve) => {
     const input = note ? el('textarea', { rows: 2, placeholder: note }) : null;
+    if (input) input.value = value;
     const finish = (v) => { box.remove(); resolve(v); };
     const box = el('div', { class: 'overlay' }, el('div', { class: 'dialog', role: 'dialog' },
       el('h2', {}, title),
@@ -65,6 +84,7 @@ function dialog({ title, body, okText = 'אישור', danger = false, note = nul
 }
 
 async function toggleAccess(u) {
+  if (!canToggle(u.id)) return toast('אין לך הרשאה לשנות את המשתמש הזה', { err: true });
   const disable = !isDisabled(u.id);
   const name = u.name || u.email || u.id;
   const ok = await dialog({
@@ -76,11 +96,28 @@ async function toggleAccess(u) {
   });
   if (!ok) return;
   try {
-    await A.data.setAccess(u.id, {
-      disabled: disable, email: u.email || '', name: u.name || '',
-      ...(disable ? { note: ok.note, disabledAt: Date.now() } : { note: '', enabledAt: Date.now() }),
-    });
+    await A.data.setMember(u.id, { disabled: disable, note: disable ? ok.note : '' });
     toast(disable ? `${name} הושבת` : `${name} הופעל מחדש ✓`);
+  } catch (e) { toast(explainError(e), { err: true, ms: 8000 }); }
+}
+
+// Superadmin only: make someone an admin, or back to a regular user.
+async function changeRole(u, role) {
+  if (!isSuper() || roleOf(u.id) === 'super' || !A.members[u.id]) return;
+  const name = u.name || u.email || u.id;
+  const ok = await dialog({
+    title: role === 'admin' ? `להפוך את ${name} למנהל?` : `להחזיר את ${name} למשתמש רגיל?`,
+    body: role === 'admin'
+      ? 'מנהל נכנס לפאנל הזה, רואה את כל המשתמשים וההרשמות, יכול להשבית משתמשים רגילים ומקבל קישור הזמנה משלו. הוא לא יכול למנות מנהלים.'
+      : 'המשתמש יאבד את הגישה לפאנל הניהול. קישורי ההזמנה שלו יכובו.',
+    okText: role === 'admin' ? '👑 מנה למנהל' : 'הפוך למשתמש', danger: role !== 'admin',
+  });
+  if (!ok) return;
+  try {
+    await A.data.setMember(u.id, { role });
+    if (role === 'admin' && !A.invites.some((i) => i.owner === u.id && i.active)) await A.data.createInvite(u.id, name);
+    if (role !== 'admin') await Promise.all(A.invites.filter((i) => i.owner === u.id && i.active).map((i) => A.data.setInvite(i.id, { active: false })));
+    toast(role === 'admin' ? `${name} מונה למנהל ✓` : `${name} הוא עכשיו משתמש רגיל`);
   } catch (e) { toast(explainError(e), { err: true, ms: 8000 }); }
 }
 
@@ -123,8 +160,37 @@ function avatar(u, size = 36) {
 }
 
 function accessChip(uid) {
+  if (!A.members[uid] && roleOf(uid) !== 'super') return el('span', { class: 'chip none', title: 'נכנס לפני שהיו קישורי הזמנה, או לא הצטרף' }, 'לא חבר');
   return isDisabled(uid) ? el('span', { class: 'chip off' }, '⛔ מושבת') : el('span', { class: 'chip on' }, '● פעיל');
 }
+
+function roleChip(uid) {
+  const r = roleOf(uid);
+  return r === 'super' ? el('span', { class: 'chip role super' }, '⭐ מנהל ראשי')
+    : r === 'admin' ? el('span', { class: 'chip role admin' }, '👑 מנהל')
+      : r === 'user' ? el('span', { class: 'chip role' }, 'משתמש') : null;
+}
+
+// Role control: a dropdown for the superadmin, a chip for everyone else.
+function roleControl(u) {
+  const r = roleOf(u.id);
+  if (!isSuper() || r === 'super' || r === 'none') return roleChip(u.id);
+  const sel = el('select', { class: 'role-sel', onchange: (e) => { const v = e.target.value; e.target.value = r; changeRole(u, v); } },
+    el('option', { value: 'user' }, 'משתמש'), el('option', { value: 'admin' }, '👑 מנהל'));
+  sel.value = r;
+  return sel;
+}
+
+function invitedByText(uid) {
+  const m = A.members[uid];
+  if (!m) return '—';
+  if (m.invitedBy === 'superadmin') return 'מנהל ראשי';
+  return m.invitedBy ? nameOf(m.invitedBy) : '—';
+}
+
+// Refs of a member with their lead counts.
+const refsOf = (uid) => Object.values(A.refs).filter((r) => r.owner === uid).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+const leadsOf = (uid) => refsOf(uid).reduce((n, r) => n + (r.leads || 0), 0);
 
 function progress(s, { big = false } = {}) {
   const t = s?.total || 0;
@@ -179,7 +245,7 @@ function parseRoute() {
   const q = new URLSearchParams(qs || '');
   const per = { p: ['day', 'week', 'month'].includes(q.get('p')) ? q.get('p') : 'day', d: /^\d{4}-\d{2}-\d{2}$/.test(q.get('d') || '') ? q.get('d') : todayStr() };
   const [name, arg] = (path || 'overview').split('/');
-  return { name: ['overview', 'users', 'user'].includes(name) ? name : 'overview', arg: arg ? decodeURIComponent(arg) : null, per };
+  return { name: ['overview', 'users', 'user', 'links', 'registrations'].includes(name) ? name : 'overview', arg: arg ? decodeURIComponent(arg) : null, per };
 }
 const href = (name, arg, per) => `#/${name}${arg ? '/' + encodeURIComponent(arg) : ''}${per ? `?p=${per.p}&d=${per.d}` : ''}`;
 const navigate = (name, arg, per) => { location.hash = href(name, arg, per); };
@@ -189,12 +255,12 @@ function clearView() {
   v.unsubs.forEach((u) => { try { u(); } catch { /* ignore */ } });
   v.maps.forEach((m) => m.remove());
   clearInterval(v.timer);
-  A.view = { id: v.id + 1, unsubs: [], maps: [], timer: null, onUsers: null };
+  A.view = { id: v.id + 1, unsubs: [], maps: [], timer: null, onUsers: null, onData: null };
   return A.view.id;
 }
 
 function route() {
-  if (!A.me || !A.isAdmin) return;
+  if (!A.me || !A.role) return;
   const r = parseRoute();
   const id = clearView();
   document.querySelectorAll('.tabs a').forEach((a) => a.classList.toggle('on', a.dataset.tab === (r.name === 'user' ? 'users' : r.name)));
@@ -203,6 +269,8 @@ function route() {
   window.scrollTo(0, 0);
   if (r.name === 'users') viewUsers(main, id);
   else if (r.name === 'user' && r.arg) viewUser(main, id, r.arg, r.per);
+  else if (r.name === 'links') viewLinks(main, id);
+  else if (r.name === 'registrations') viewRegistrations(main, id);
   else viewOverview(main, id, r.per);
 }
 
@@ -296,19 +364,23 @@ function viewUsers(main, id) {
       return;
     }
     list.replaceChildren(el('div', { class: 'tbl-wrap' }, el('table', { class: 'tbl' },
-      el('thead', {}, el('tr', {}, el('th', {}, 'משתמש'), el('th', {}, 'מצב'), el('th', {}, 'היום'), el('th', {}, 'נראה לאחרונה'), el('th', {}, 'מיקום אחרון'), el('th', {}, ''))),
+      el('thead', {}, el('tr', {}, el('th', {}, 'משתמש'), el('th', {}, 'תפקיד'), el('th', {}, 'מצב'), el('th', {}, 'הוזמן ע״י'), el('th', {}, 'היום'),
+        el('th', {}, 'נראה לאחרונה'), el('th', {}, 'מיקום אחרון'), el('th', { class: 'num', title: 'נרשמו דרך קישורי ההרשמה שלו' }, 'לידים'), el('th', {}, ''))),
       el('tbody', {}, users.map((u) => {
-        const acc = A.access[u.id];
+        const m = A.members[u.id];
         return el('tr', { class: isDisabled(u.id) ? 'disabled' : '' },
           el('td', {}, el('a', { class: 'who', href: href('user', u.id, { p: 'day', d: todayStr() }) }, avatar(u),
             el('div', {}, el('b', {}, u.name || '—'), el('div', { class: 'muted small' }, u.email || u.id)))),
-          el('td', {}, accessChip(u.id), isDisabled(u.id) && acc?.note ? el('div', { class: 'muted small' }, acc.note) : null),
+          el('td', {}, roleControl(u)),
+          el('td', {}, accessChip(u.id), isDisabled(u.id) && m?.note ? el('div', { class: 'muted small' }, m.note) : null),
+          el('td', { class: 'small' }, invitedByText(u.id), m?.joinedAt ? el('div', { class: 'muted small' }, fmtStamp(m.joinedAt).slice(0, 10)) : null),
           el('td', { class: 'w-progress' }, today[u.id] ? (today[u.id].total ? el('div', {}, progress(today[u.id]), el('div', { class: 'muted small' }, `${done(today[u.id])}/${today[u.id].total} בוצעו`)) : el('span', { class: 'muted' }, 'לא עובד')) : el('span', { class: 'muted' }, '…')),
           el('td', { class: 'small', title: fmtStamp(u.lastSeen) }, fmtAgo(u.lastSeen)),
           el('td', { class: 'small' }, u.lastLocation ? el('a', { href: `https://www.google.com/maps?q=${u.lastLocation.lat},${u.lastLocation.lng}`, target: '_blank', rel: 'noopener', title: fmtStamp(u.lastLocation.at) }, `📍 ${fmtAgo(u.lastLocation.at)}`) : el('span', { class: 'muted' }, '—')),
+          el('td', { class: 'num' }, leadsOf(u.id) || '—'),
           el('td', { class: 'actions' },
             el('a', { class: 'btn small', href: href('user', u.id, { p: 'day', d: todayStr() }) }, 'פרטים'),
-            el('button', { class: 'btn small ' + (isDisabled(u.id) ? 'primary' : 'danger-outline'), type: 'button', onclick: () => toggleAccess(u) }, isDisabled(u.id) ? 'הפעל' : 'השבת')),
+            canToggle(u.id) ? el('button', { class: 'btn small ' + (isDisabled(u.id) ? 'primary' : 'danger-outline'), type: 'button', onclick: () => toggleAccess(u) }, isDisabled(u.id) ? 'הפעל' : 'השבת') : null),
         );
       })))));
   };
@@ -325,6 +397,221 @@ function viewUsers(main, id) {
   A.view.timer = setInterval(loadToday, 60000);
 }
 
+// ------------------------------------------------------------------ referral codes (refs) of a user
+const REF_KIND = { email: 'לפי אימייל', name: 'לפי שם', custom: 'מותאם' };
+const regsByRef = () => {
+  const out = {};
+  for (const r of A.regs) {
+    const k = String(r.ref || '').trim().toLowerCase();
+    if (!k) continue;
+    (out[k] ||= { leads: 0, joined: 0 }).leads++;
+    if (r.status === 'joined') out[k].joined++;
+  }
+  return out;
+};
+
+function refsPanel(u) {
+  const refs = refsOf(u.id);
+  const counts = regsByRef();
+  const primary = A.members[u.id]?.primaryRef;
+  const box = el('div', { class: 'refs-panel' }, el('h3', {}, '🔗 קישורי הרשמה (Ref)'));
+  if (!refs.length) box.append(el('p', { class: 'muted small' }, 'עדיין לא נוצרו קישורי הרשמה. המשתמש יוצר אותם באפליקציה: ☰ ← הזמן חבר.'));
+  else {
+    box.append(el('div', { class: 'tbl-wrap' }, el('table', { class: 'tbl compact' },
+      el('thead', {}, el('tr', {}, ['Ref', 'סוג', 'מצב', 'לידים', 'הצטרפו', ''].map((h, i) => el('th', { class: i === 3 || i === 4 ? 'num' : '' }, h)))),
+      el('tbody', {}, refs.map((r) => el('tr', { class: r.active === false ? 'idle' : '' },
+        el('td', {}, el('b', { class: 'mono' }, r.id), r.id === primary ? el('span', { class: 'chip role admin', title: 'הקישור הראשי שהמשתמש בחר' }, '⭐ ראשי') : null),
+        el('td', { class: 'small' }, r.label ? `${REF_KIND[r.kind] || r.kind} · ${r.label}` : REF_KIND[r.kind] || r.kind),
+        el('td', {}, r.active === false ? el('span', { class: 'chip off' }, 'כבוי') : el('span', { class: 'chip on' }, 'פעיל')),
+        el('td', { class: 'num' }, counts[r.id]?.leads || 0),
+        el('td', { class: 'num ok' }, counts[r.id]?.joined || 0),
+        el('td', { class: 'actions' },
+          el('button', { class: 'btn small', type: 'button', onclick: () => copyText(registrationLink(r.id), 'קישור ההרשמה הועתק ✓') }, '📋 קישור'),
+          isSuper() ? el('button', { class: 'btn small', type: 'button', onclick: async () => {
+            try { await A.data.updateRef(r.id, { active: r.active === false }); } catch (e) { toast(explainError(e), { err: true }); }
+          } }, r.active === false ? 'הפעל' : 'כבה') : null)))))));
+  }
+  // Superadmin: custom refs for A/B tests ("gil-fb-a", "gil-fb-b" …).
+  if (isSuper() && A.members[u.id]) {
+    const idIn = el('input', { dir: 'ltr', placeholder: 'gil-fb-a', maxlength: 40, autocomplete: 'off' });
+    const labelIn = el('input', { placeholder: 'תיאור, למשל: פייסבוק A', maxlength: 60 });
+    idIn.addEventListener('input', () => { idIn.value = idIn.value.toLowerCase().replace(/[^a-z0-9._-]/g, ''); });
+    const add = el('button', { class: 'btn small primary', type: 'button' }, '➕ הוסף Ref מותאם');
+    add.addEventListener('click', async () => {
+      const refId = idIn.value.trim();
+      if (!/^[a-z0-9._-]{3,40}$/.test(refId)) return toast('Ref: 3–40 תווים – אותיות באנגלית, ספרות, נקודה, מקף', { err: true });
+      add.disabled = true;
+      try { await A.data.createRef(refId, { owner: u.id, kind: 'custom', label: labelIn.value.trim() }); toast(`נוסף ${refId} ✓`); idIn.value = ''; labelIn.value = ''; }
+      catch (e) { toast(e.code === 'ref-taken' ? `ה-Ref "${refId}" כבר תפוס` : explainError(e), { err: true, ms: 6000 }); }
+      add.disabled = false;
+    });
+    box.append(el('div', { class: 'ref-add' }, idIn, labelIn, add));
+  }
+  return box;
+}
+
+// ------------------------------------------------------------------ magic links (invites)
+const myInvite = () => A.invites.find((i) => i.owner === A.me.uid && i.active);
+const joinsOf = (token) => Object.values(A.members).filter((m) => m.inviteToken === token).length;
+let creatingInvite = null;
+async function ensureMyInvite() {
+  if (myInvite()) return myInvite();
+  if (!A.invitesLoaded) return null;
+  creatingInvite ||= A.data.createInvite(A.me.uid, A.me.name || A.me.email).finally(() => { creatingInvite = null; });
+  const token = await creatingInvite;
+  return A.invites.find((i) => i.id === token) || { id: token, owner: A.me.uid, active: true };
+}
+
+async function regenerateInvite(inv) {
+  const ok = await dialog({ title: 'ליצור קישור חדש?', body: 'הקישור הנוכחי יפסיק לעבוד מיד. מי שכבר הצטרף דרכו נשאר משתמש.', okText: '🔄 צור קישור חדש', danger: true });
+  if (!ok) return;
+  try {
+    await A.data.setInvite(inv.id, { active: false, deactivatedAt: Date.now() });
+    await A.data.createInvite(inv.owner, inv.ownerName || nameOf(inv.owner));
+    toast('נוצר קישור חדש ✓');
+  } catch (e) { toast(explainError(e), { err: true, ms: 8000 }); }
+}
+
+function viewLinks(main, id) {
+  const mine = el('div', { class: 'card' });
+  const all = el('div', { class: 'card' });
+  main.append(el('div', { class: 'view-head' }, el('h1', {}, '🔗 קישורי הצטרפות (Magic Link)')),
+    el('p', { class: 'muted' }, 'רק מי שמקבל קישור כזה יכול להירשם ל-SmartRoute. כל מי שיש לו את הקישור יכול להירשם, והמשתמש החדש נרשם על שם בעל הקישור.'),
+    mine);
+  if (isSuper()) main.append(all);
+
+  const draw = async () => {
+    if (id !== A.view.id) return;
+    if (!A.invitesLoaded || !A.membersLoaded) { mine.replaceChildren(el('p', { class: 'muted pad' }, 'טוען…')); return; }
+    let inv = myInvite();
+    if (!inv) {
+      mine.replaceChildren(el('p', { class: 'muted pad' }, 'יוצר את הקישור שלך…'));
+      try { inv = await ensureMyInvite(); } catch (e) { mine.replaceChildren(el('p', { class: 'error pad' }, explainError(e))); return; }
+      if (id !== A.view.id || !inv) return;
+    }
+    const url = magicLink(inv.id);
+    const old = A.invites.filter((i) => i.owner === A.me.uid && !i.active);
+    mine.replaceChildren(
+      el('h3', {}, 'הקישור שלי'),
+      el('div', { class: 'link-box' },
+        el('div', { class: 'link-url mono' }, url),
+        el('div', { class: 'link-actions' },
+          el('button', { class: 'btn primary', type: 'button', onclick: () => copyText(url, 'הקישור הועתק ✓') }, '📋 העתק'),
+          el('a', { class: 'btn', href: waLink('', inviteText(url)), target: '_blank', rel: 'noopener' }, '💬 שלח בוואטסאפ'),
+          el('button', { class: 'btn danger-outline', type: 'button', onclick: () => regenerateInvite(inv) }, '🔄 קישור חדש')),
+        el('div', { class: 'muted small' }, `${joinsOf(inv.id)} הצטרפו דרך הקישור הזה · נוצר ${fmtStamp(inv.createdAt).slice(0, 10)}`),
+        old.length ? el('div', { class: 'muted small' }, `קישורים ישנים (כבויים): ${old.map((o) => `${o.id.slice(0, 6)}… (${joinsOf(o.id)} הצטרפו)`).join(' · ')}`) : null),
+    );
+
+    if (!isSuper()) return;
+    // Superadmin: every link of every admin.
+    const admins = A.users.filter((u) => ['admin', 'super'].includes(roleOf(u.id)));
+    const withoutLink = admins.filter((u) => !A.invites.some((i) => i.owner === u.id && i.active));
+    const rows = A.invites.slice().sort((a, b) => (b.active === true) - (a.active === true) || (b.createdAt || 0) - (a.createdAt || 0));
+    all.replaceChildren(
+      el('h3', {}, 'כל הקישורים (מנהל ראשי בלבד)'),
+      el('div', { class: 'tbl-wrap' }, el('table', { class: 'tbl' },
+        el('thead', {}, el('tr', {}, ['בעלים', 'קישור', 'נוצר', 'מצב', 'הצטרפו', ''].map((h, i) => el('th', { class: i === 4 ? 'num' : '' }, h)))),
+        el('tbody', {}, rows.map((i) => el('tr', { class: i.active ? '' : 'idle' },
+          el('td', {}, el('a', { href: href('user', i.owner, { p: 'day', d: todayStr() }) }, nameOf(i.owner)), ' ', roleChip(i.owner)),
+          el('td', { class: 'mono small' }, i.id.slice(0, 8) + '…'),
+          el('td', { class: 'small' }, fmtStamp(i.createdAt).slice(0, 10)),
+          el('td', {}, i.active ? el('span', { class: 'chip on' }, 'פעיל') : el('span', { class: 'chip off' }, 'כבוי')),
+          el('td', { class: 'num' }, joinsOf(i.id)),
+          el('td', { class: 'actions' },
+            el('button', { class: 'btn small', type: 'button', onclick: () => copyText(magicLink(i.id), 'הקישור הועתק ✓') }, '📋 העתק'),
+            el('button', { class: 'btn small', type: 'button', onclick: async () => {
+              try { await A.data.setInvite(i.id, { active: !i.active }); } catch (e) { toast(explainError(e), { err: true }); }
+            } }, i.active ? 'כבה' : 'הפעל'))))))),
+      withoutLink.length ? el('div', { class: 'pad' }, el('span', { class: 'muted small' }, 'מנהלים בלי קישור פעיל: '),
+        withoutLink.map((u) => el('button', { class: 'btn small', type: 'button', onclick: async () => {
+          try { await A.data.createInvite(u.id, u.name || u.email); toast(`נוצר קישור ל${u.name || u.email} ✓`); } catch (e) { toast(explainError(e), { err: true }); }
+        } }, `➕ צור ל${u.name || u.email}`))) : null,
+    );
+  };
+  draw();
+  A.view.onData = draw;
+  A.view.onUsers = draw;
+}
+
+// ------------------------------------------------------------------ registrations
+const REG_STATUS = {
+  new: { label: 'חדש', cls: 'new' },
+  contacted: { label: 'נוצר קשר', cls: 'contacted' },
+  joined: { label: 'הצטרף', cls: 'joined' },
+  rejected: { label: 'לא רלוונטי', cls: 'rejected' },
+};
+const REG_FILTERS = [['open', 'פתוחים', (r) => r.status === 'new' || r.status === 'contacted'], ['new', 'חדשים', (r) => r.status === 'new'],
+  ['joined', 'הצטרפו', (r) => r.status === 'joined'], ['rejected', 'לא רלוונטי', (r) => r.status === 'rejected'], ['all', 'הכל', () => true]];
+
+async function setRegStatus(r, status, extra = {}) {
+  try { await A.data.updateRegistration(r.id, { status, handledBy: A.me.email || '', handledAt: Date.now(), ...extra }); }
+  catch (e) { toast(explainError(e), { err: true, ms: 8000 }); }
+}
+
+function viewRegistrations(main, id) {
+  const f = A.regsFilter;
+  const search = el('input', { type: 'search', placeholder: 'חיפוש: שם / טלפון / Ref', value: f.q });
+  const seg = el('div', { class: 'seg-ctl' });
+  const list = el('div', { class: 'card' });
+  main.append(el('div', { class: 'view-head' }, el('h1', {}, '📝 הרשמות'), el('div', { class: 'filters' }, search, seg)),
+    el('p', { class: 'muted' }, 'פניות מטופס ההרשמה באתר SmartRoute. מדברים עם הפונה ושולחים לו את קישור ההצטרפות (Magic Link) שלך.'),
+    list);
+
+  const refCell = (r) => {
+    if (!r.ref) return el('span', { class: 'muted' }, '—');
+    const ref = refOf(r.ref);
+    return el('div', {}, el('span', { class: 'mono' }, r.ref),
+      el('div', { class: 'small' + (ref ? '' : ' muted') }, ref ? `${nameOf(ref.owner)}${ref.label ? ' · ' + ref.label : ''}` : 'Ref לא מוכר'));
+  };
+
+  const draw = () => {
+    if (id !== A.view.id) return;
+    seg.replaceChildren(...REG_FILTERS.map(([k, label, fn]) =>
+      el('button', { type: 'button', class: f.status === k ? 'on' : '', onclick: () => { f.status = k; draw(); } }, `${label} (${A.regs.filter(fn).length})`)));
+    if (!A.regsLoaded) { list.replaceChildren(el('p', { class: 'muted pad' }, 'טוען…')); return; }
+    const fn = REG_FILTERS.find(([k]) => k === f.status)?.[2] || (() => true);
+    const q = f.q.trim().toLowerCase();
+    const rows = A.regs.filter(fn).filter((r) => !q || `${r.name} ${r.mobile} ${r.ref}`.toLowerCase().includes(q));
+    if (!rows.length) { list.replaceChildren(el('p', { class: 'muted pad' }, A.regs.length ? 'אין פניות בסינון הזה.' : 'אין עדיין פניות. קישור הטופס: ' + APP.url + 'Registration')); return; }
+    list.replaceChildren(el('div', { class: 'tbl-wrap' }, el('table', { class: 'tbl' },
+      el('thead', {}, el('tr', {}, ['מתי', 'שם', 'טלפון', 'Ref / הופנה ע״י', 'מקור', 'סטטוס', ''].map((h) => el('th', {}, h)))),
+      el('tbody', {}, rows.map((r) => {
+        const st = REG_STATUS[r.status] || REG_STATUS.new;
+        const sel = el('select', { class: 'reg-status ' + st.cls, onchange: (e) => setRegStatus(r, e.target.value) },
+          Object.entries(REG_STATUS).map(([k, s]) => el('option', { value: k }, s.label)));
+        sel.value = r.status in REG_STATUS ? r.status : 'new';
+        const send = async () => {
+          const inv = await ensureMyInvite().catch((e) => { toast(explainError(e), { err: true }); return null; });
+          if (!inv) return;
+          window.open(waLink(r.mobile, inviteText(magicLink(inv.id), r.name.split(' ')[0])), '_blank', 'noopener');
+          if (r.status === 'new') setRegStatus(r, 'contacted');
+        };
+        return el('tr', { class: 'reg-row ' + st.cls },
+          el('td', { class: 'small', title: fmtStamp(r.createdAt) }, fmtAgo(r.createdAt), el('div', { class: 'muted' }, fmtStamp(r.createdAt).slice(0, 10))),
+          el('td', {}, el('b', {}, r.name), r.note ? el('div', { class: 'muted small' }, '📝 ' + r.note) : null),
+          el('td', {}, el('a', { class: 'mono', href: 'tel:' + r.mobile }, r.mobile)),
+          el('td', {}, refCell(r)),
+          el('td', { class: 'small' }, r.source === 'link' ? 'קישור' : 'ידני'),
+          el('td', {}, sel, r.handledBy ? el('div', { class: 'muted small' }, `${r.handledBy.split('@')[0]} · ${fmtAgo(r.handledAt)}`) : null),
+          el('td', { class: 'actions' },
+            el('button', { class: 'btn small primary', type: 'button', title: 'פותח וואטסאפ עם הודעה וקישור ההצטרפות שלך', onclick: send }, '💬 שלח קישור'),
+            el('button', { class: 'btn small', type: 'button', onclick: async () => {
+              const inv = await ensureMyInvite().catch(() => null);
+              if (inv) copyText(magicLink(inv.id), 'קישור ההצטרפות שלך הועתק ✓');
+            } }, '📋'),
+            el('button', { class: 'btn small', type: 'button', title: 'הערה', onclick: async () => {
+              const ok = await dialog({ title: `הערה – ${r.name}`, okText: 'שמור', note: 'למשל: יחזור אליי ביום ראשון', value: r.note || '' });
+              if (ok) try { await A.data.updateRegistration(r.id, { note: ok.note }); } catch (e) { toast(explainError(e), { err: true }); }
+            } }, '📝')));
+      })))));
+  };
+  search.addEventListener('input', () => { f.q = search.value; draw(); });
+  draw();
+  A.view.onData = draw;
+  A.view.onUsers = draw;
+}
+
 // ------------------------------------------------------------------ user detail
 function viewUser(main, id, uid, per) {
   const go = (p) => navigate('user', uid, p);
@@ -339,20 +626,26 @@ function viewUser(main, id, uid, per) {
   const drawHead = () => {
     const u = userById(uid);
     if (!u) { head.replaceChildren(el('p', { class: 'muted pad' }, A.usersLoaded ? 'המשתמש לא נמצא באפליקציה הזו.' : 'טוען…')); return; }
-    const acc = A.access[uid];
+    const m = A.members[uid];
+    const invited = Object.values(A.members).filter((x) => x.invitedBy === uid);
     head.replaceChildren(
       el('div', { class: 'profile-main' }, avatar(u, 64),
         el('div', { class: 'profile-id' },
-          el('h1', {}, u.name || '—', ' ', accessChip(uid)),
+          el('h1', {}, u.name || '—', ' ', accessChip(uid), ' ', roleChip(uid)),
           el('div', {}, u.email || ''),
           el('div', { class: 'muted small mono' }, uid))),
       el('dl', { class: 'facts' },
+        el('dt', {}, 'תפקיד'), el('dd', {}, roleControl(u)),
+        el('dt', {}, 'הוזמן ע״י'), el('dd', {}, invitedByText(uid), m?.joinedAt ? ` · הצטרף ${fmtStamp(m.joinedAt).slice(0, 10)}` : ''),
         el('dt', {}, 'נראה לאחרונה'), el('dd', { title: fmtStamp(u.lastSeen) }, fmtAgo(u.lastSeen)),
-        el('dt', {}, 'משתמש מאז'), el('dd', {}, u.firstSeen ? fmtStamp(u.firstSeen).slice(0, 10) : '—'),
         el('dt', {}, 'מיקום אחרון'), el('dd', {}, locationText(u.lastLocation)),
-        isDisabled(uid) ? [el('dt', {}, 'הושבת'), el('dd', {}, `${fmtStamp(acc.disabledAt || acc.updatedAt)}${acc.note ? ' · ' + acc.note : ''}`)] : null),
+        el('dt', {}, 'הזמין'), el('dd', {}, invited.length
+          ? invited.flatMap((x, i) => [i ? ', ' : '', el('a', { href: href('user', x.id, { p: 'day', d: todayStr() }) }, x.name || x.email || x.id)])
+          : el('span', { class: 'muted' }, 'אף אחד עדיין')),
+        isDisabled(uid) ? [el('dt', {}, 'הושבת'), el('dd', {}, `${fmtStamp(m.updatedAt)}${m.note ? ' · ' + m.note : ''}`)] : null),
       el('div', { class: 'profile-actions' },
-        el('button', { class: 'btn ' + (isDisabled(uid) ? 'primary' : 'danger-outline'), type: 'button', onclick: () => toggleAccess(u) }, isDisabled(uid) ? '✓ הפעל משתמש' : '⛔ השבת משתמש')),
+        canToggle(uid) ? el('button', { class: 'btn ' + (isDisabled(uid) ? 'primary' : 'danger-outline'), type: 'button', onclick: () => toggleAccess(u) }, isDisabled(uid) ? '✓ הפעל משתמש' : '⛔ השבת משתמש') : null),
+      refsPanel(u),
     );
   };
   drawHead();
@@ -550,15 +843,57 @@ function userRange(body, id, uid, per, drawHead) {
   autoRefresh(per, load);
 }
 
-// ------------------------------------------------------------------ boot
+// ------------------------------------------------------------------ live data & boot
+// Users = members (who may use SmartRoute) merged with their app profiles (last seen, location).
+function mergeUsers() {
+  const map = new Map(A.profiles.map((p) => [p.id, { ...p }]));
+  for (const m of Object.values(A.members)) {
+    const cur = map.get(m.id) || { id: m.id };
+    map.set(m.id, { ...cur, name: cur.name || m.name, email: cur.email || m.email });
+  }
+  A.users = [...map.values()];
+  A.usersLoaded = A.profilesLoaded && A.membersLoaded;
+}
 
-function listenUsers() {
+// Members see how many leads their refs brought (refs/{ref}.leads) without reading registrations,
+// so the panel keeps those counters in sync with the registration list.
+let leadsTimer = null;
+function syncLeads() {
+  clearTimeout(leadsTimer);
+  leadsTimer = setTimeout(() => {
+    if (!A.regsLoaded) return;
+    const counts = regsByRef();
+    for (const r of Object.values(A.refs)) {
+      const n = counts[r.id.toLowerCase()]?.leads || 0;
+      if ((r.leads || 0) !== n) A.data.updateRef(r.id, { leads: n }).catch(() => {});
+    }
+  }, 1500);
+}
+
+function updateBadge() {
+  const n = A.regs.filter((r) => r.status === 'new').length;
+  $('#regBadge').textContent = n;
+  $('#regBadge').hidden = !n;
+}
+
+function listenAll() {
   A.listeners.forEach((u) => u());
-  A.users = []; A.usersLoaded = false;
+  Object.assign(A, { users: [], profiles: [], members: {}, invites: [], refs: {}, regs: [], usersLoaded: false, profilesLoaded: false, membersLoaded: false, invitesLoaded: false, regsLoaded: false });
   const onErr = (e) => { $('#main').replaceChildren(el('div', { class: 'card' }, el('p', { class: 'error pad' }, explainError(e)))); };
+  const usersChanged = () => { mergeUsers(); A.view.onUsers?.(); };
   A.listeners = [
-    A.data.watchUsers(A.app.root, (users) => { A.users = users; A.usersLoaded = true; A.view.onUsers?.(); }, onErr),
-    A.data.watchAccess((acc) => { A.access = acc; A.view.onUsers?.(); }, onErr),
+    A.data.watchUsers(A.app.root, (p) => { A.profiles = p; A.profilesLoaded = true; usersChanged(); }, onErr),
+    A.data.watchMembers((list) => {
+      A.members = Object.fromEntries(list.map((m) => [m.id, m]));
+      A.membersLoaded = true;
+      // Lost admin rights while the panel is open (demoted / disabled) → back to the gate.
+      const mine = A.members[A.me.uid];
+      if (A.role === 'admin' && (mine?.role !== 'admin' || mine?.disabled)) { location.reload(); return; }
+      usersChanged();
+    }, onErr),
+    A.data.watchInvites(isSuper() ? null : A.me.uid, (list) => { A.invites = list; A.invitesLoaded = true; A.view.onData?.(); }, onErr),
+    A.data.watchRefs((list) => { A.refs = Object.fromEntries(list.map((r) => [r.id.toLowerCase(), r])); syncLeads(); A.view.onUsers?.(); }, onErr),
+    A.data.watchRegistrations((list) => { A.regs = list; A.regsLoaded = true; updateBadge(); syncLeads(); A.view.onData?.(); }, onErr),
   ];
 }
 
@@ -577,14 +912,25 @@ async function boot() {
   $('#logoutBtn').addEventListener('click', () => A.data.signOut());
   window.addEventListener('hashchange', route);
 
-  A.data.onAuth((user) => {
+  // Only the superadmin and active admins may use the panel. Regular users – never.
+  A.data.onAuth(async (user) => {
     A.me = user;
-    A.isAdmin = !!user && ADMIN_EMAILS.includes(String(user.email).toLowerCase());
+    A.role = null;
     if (!user) { A.listeners.forEach((u) => u()); A.listeners = []; clearView(); showScreen('login'); return; }
-    if (!A.isAdmin) { $('#deniedEmail').textContent = user.email; showScreen('denied'); return; }
-    $('#meBox').replaceChildren(avatar(user, 28), el('span', { class: 'me-email' }, user.email));
+    showScreen('loading');
+    let role = null;
+    if (String(user.email || '').toLowerCase() === SUPERADMIN) role = 'super';
+    else {
+      const m = await A.data.getMember(user.uid).catch(() => null);
+      if (m?.role === 'admin' && !m.disabled) role = 'admin';
+    }
+    if (A.me !== user) return;
+    if (!role) { $('#deniedEmail').textContent = user.email; showScreen('denied'); return; }
+    A.role = role;
+    $('#meBox').replaceChildren(avatar(user, 28), el('span', { class: 'me-email' }, user.email),
+      el('span', { class: 'chip role ' + (role === 'super' ? 'super' : 'admin') }, role === 'super' ? '⭐ מנהל ראשי' : '👑 מנהל'));
     showScreen('shell');
-    listenUsers();
+    listenAll();
     route();
   });
 }

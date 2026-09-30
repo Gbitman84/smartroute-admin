@@ -1,10 +1,14 @@
-// Data layer for the admin panel. Reads the SmartRoute data (labUsers/{uid}) of every user
-// (allowed for admins by firestore.rules) and writes only access/{uid} (enable / disable).
-// ?demo=1 → generated sample data in memory, no cloud access.
+// Data layer for the admin panel. Reads the SmartRoute data (labUsers/{uid}) of every user and
+// manages members (roles, enable/disable), magic links (invites), referral codes (refs) and
+// registration requests. Every permission is enforced by firestore.rules.
+// ?demo=1 → generated sample data in memory, no cloud access (&as=admin → view as a regular admin).
 import { firebaseConfig } from './config.js';
 import { todayStr, addDays } from './util.js';
 
 const FB = 'https://www.gstatic.com/firebasejs/10.12.2';
+const TOKEN_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+export const newToken = (n = 24) => Array.from(crypto.getRandomValues(new Uint8Array(n)), (b) => TOKEN_CHARS[b % TOKEN_CHARS.length]).join('');
+const millis = (v) => (v?.toMillis ? v.toMillis() : v ?? null);
 
 // ---------------------------------------------------------------- Firebase
 async function firebaseBackend() {
@@ -36,9 +40,41 @@ async function firebaseBackend() {
     },
     signOut: () => auth.signOut(a),
 
+    // Profiles written by the app (labUsers/{uid}: name, last seen, last location).
     watchUsers: (root, cb, onErr) => fs.onSnapshot(fs.collection(db, root), (s) => cb(list(s)), onErr),
-    watchAccess: (cb, onErr) => fs.onSnapshot(fs.collection(db, 'access'), (s) => cb(Object.fromEntries(list(s).map((x) => [x.id, x]))), onErr),
-    setAccess: (uid, patch) => fs.setDoc(fs.doc(db, 'access', uid), { ...patch, updatedAt: Date.now(), updatedBy: me?.email || '' }, { merge: true }),
+
+    // Members: role ('user' | 'admin'), disabled, who invited them, refSuffix / primaryRef.
+    async getMember(uid) { const s = await fs.getDoc(fs.doc(db, 'members', uid)); return s.exists() ? { id: s.id, ...s.data() } : null; },
+    watchMembers: (cb, onErr) => fs.onSnapshot(fs.collection(db, 'members'), (s) => cb(list(s)), onErr),
+    setMember: (uid, patch) => fs.updateDoc(fs.doc(db, 'members', uid), { ...patch, updatedAt: Date.now(), updatedBy: me?.email || '' }),
+
+    // Magic links: invites/{token}. ownerUid → only that owner's links (regular admins), null → all.
+    watchInvites: (ownerUid, cb, onErr) => fs.onSnapshot(
+      ownerUid ? fs.query(fs.collection(db, 'invites'), fs.where('owner', '==', ownerUid)) : fs.collection(db, 'invites'),
+      (s) => cb(list(s)), onErr),
+    async createInvite(owner, ownerName) {
+      const token = newToken();
+      await fs.setDoc(fs.doc(db, 'invites', token), { owner, ownerName: ownerName || '', active: true, createdAt: Date.now(), createdBy: me?.email || '' });
+      return token;
+    },
+    setInvite: (token, patch) => fs.updateDoc(fs.doc(db, 'invites', token), patch),
+
+    // Referral codes: refs/{ref}. createRef fails if the ref is already taken.
+    watchRefs: (cb, onErr) => fs.onSnapshot(fs.collection(db, 'refs'), (s) => cb(list(s)), onErr),
+    async createRef(id, data) {
+      await fs.runTransaction(db, async (tx) => {
+        const ref = fs.doc(db, 'refs', id);
+        if ((await tx.get(ref)).exists()) throw Object.assign(new Error('ref taken'), { code: 'ref-taken' });
+        tx.set(ref, { ...data, active: true, leads: 0, createdAt: Date.now() });
+      });
+    },
+    updateRef: (id, patch) => fs.updateDoc(fs.doc(db, 'refs', id), patch),
+
+    // Registration requests from the public form (newest first).
+    watchRegistrations: (cb, onErr) => fs.onSnapshot(
+      fs.query(fs.collection(db, 'registrations'), fs.orderBy('createdAt', 'desc'), fs.limit(500)),
+      (s) => cb(s.docs.map((d) => ({ id: d.id, ...d.data(), createdAt: millis(d.data().createdAt) }))), onErr),
+    updateRegistration: (id, patch) => fs.updateDoc(fs.doc(db, 'registrations', id), patch),
 
     // Day docs ("2026-09-30", "2026-09-30_v2" …) whose date is within [from, to].
     async daysInRange(root, uid, from, to) {
@@ -67,7 +103,36 @@ function demoBackend() {
   const at = (date, h, m = 0) => { const [y, mo, d] = date.split('-'); return new Date(+y, +mo - 1, +d, h, m).getTime(); };
 
   const store = { labUsers: {} };        // root → uid → { profile, days: { key: { doc, deliveries } } }
-  const access = { u3: { disabled: true, note: 'עזב את העבודה', updatedAt: now - 5 * 24 * H, updatedBy: 'admin' } };
+  // Members, magic links, refs and registrations. "sa" is the superadmin; u2 is an admin.
+  const asAdmin = new URLSearchParams(location.search).get('as') === 'admin';
+  const meUser = asAdmin ? { uid: 'u2', name: 'מיכל לוי', email: 'michal.l@example.com' } : { uid: 'sa', name: 'Gil (superadmin)', email: 'gbitman.bd@gmail.com' };
+  const mem = (id, o) => ({ id, uid: id, role: 'user', disabled: false, joinedAt: now - 30 * 24 * H, refSuffix: 'x' + id.padEnd(5, '0').slice(0, 5), ...o });
+  const members = {
+    sa: mem('sa', { name: 'Gil', email: 'gbitman.bd@gmail.com', invitedBy: 'superadmin', refSuffix: 'd87d32', primaryRef: 'gil-d87d32', joinedAt: now - 90 * 24 * H }),
+    u2: mem('u2', { name: 'מיכל לוי', email: 'michal.l@example.com', role: 'admin', invitedBy: 'sa', inviteToken: 'SaToken000000000000001', refSuffix: 'm1c4l0', primaryRef: 'michal-m1c4l0' }),
+    u1: mem('u1', { name: 'יוסי כהן', email: 'yossi.courier@example.com', invitedBy: 'u2', inviteToken: 'U2Token000000000000001', refSuffix: 'y0551e' }),
+    u3: mem('u3', { name: 'דני אברהם', email: 'dani.a@example.com', invitedBy: 'sa', inviteToken: 'SaToken000000000000001', disabled: true, note: 'עזב את העבודה', updatedAt: now - 5 * 24 * H, updatedBy: 'admin' }),
+    u4: mem('u4', { name: 'Ron Test', email: 'ron.test@example.com', invitedBy: 'u2', inviteToken: 'U2Token000000000000001', joinedAt: now - 4 * 24 * H }),
+  };
+  const invites = {
+    SaToken000000000000001: { id: 'SaToken000000000000001', owner: 'sa', ownerName: 'Gil', active: true, createdAt: now - 90 * 24 * H },
+    U2Token000000000000001: { id: 'U2Token000000000000001', owner: 'u2', ownerName: 'מיכל לוי', active: true, createdAt: now - 30 * 24 * H },
+  };
+  const refs = {};
+  const addRef = (id, owner, kind, label = '', leads = 0, active = true) => (refs[id] = { id, owner, kind, label, leads, active, createdAt: now - 20 * 24 * H });
+  addRef('gbitman.bd-d87d32', 'sa', 'email'); addRef('gil-d87d32', 'sa', 'name', '', 3); addRef('gil-fb-a', 'sa', 'custom', 'Facebook A', 2); addRef('gil-fb-b', 'sa', 'custom', 'Facebook B', 1);
+  addRef('michal.l-m1c4l0', 'u2', 'email'); addRef('michal-m1c4l0', 'u2', 'name', '', 1);
+  const reg = (id, name, mobile, ref, hoursAgo, status = 'new', extra = {}) => ({ id, name, mobile, ref, source: ref ? 'link' : 'manual', createdAt: now - hoursAgo * H, status, ...extra });
+  const registrations = {
+    r1: reg('r1', 'אורי שלום', '0521234567', 'gil-d87d32', 1),
+    r2: reg('r2', 'Tamar B', '0547654321', 'gil-fb-a', 5),
+    r3: reg('r3', 'שי מזרחי', '0501112233', 'gil-fb-a', 26, 'contacted', { handledBy: 'gbitman.bd@gmail.com', handledAt: now - 20 * H, note: 'יחזור אליי ביום ראשון' }),
+    r4: reg('r4', 'נוי כהן', '0587778899', '', 50, 'joined', { handledBy: 'michal.l@example.com', handledAt: now - 40 * H }),
+    r5: reg('r5', 'ליאור', '0533334444', 'michal-m1c4l0', 3),
+    r6: reg('r6', 'דוד פרץ', '0529990000', 'gil-fb-b', 70, 'rejected', { note: 'לא מתאים' }),
+    r7: reg('r7', 'רחל', '0506665555', 'gil-d87d32', 30),
+    r8: reg('r8', 'אנונימי', '0501231231', 'someone', 8),
+  };
 
   function makeDay(date, n, doneRatio, { withStats = true, startH = 8.5 } = {}) {
     const deliveries = [];
@@ -149,11 +214,23 @@ function demoBackend() {
   const days = (root, uid, from, to) => Object.values(store[root][uid]?.days || {}).map((x) => clone(x.doc)).filter((d) => d.date >= from && d.date <= to);
   return {
     mode: 'demo',
-    onAuth(cb) { setTimeout(() => cb({ uid: 'admin', name: 'מנהל (הדגמה)', email: 'gbitman.bd@gmail.com' }), 0); return () => {}; },
+    onAuth(cb) { setTimeout(() => cb({ ...meUser }), 0); return () => {}; },
     signIn: async () => {}, signOut: async () => { location.search = ''; },
     watchUsers: (root, cb) => watch(() => cb(Object.values(store[root]).map((u) => clone(u.profile)))),
-    watchAccess: (cb) => watch(() => cb(clone(access))),
-    setAccess: async (uid, patch) => { access[uid] = { ...(access[uid] || {}), ...patch, updatedAt: Date.now(), updatedBy: 'admin' }; emit(); },
+    getMember: async (uid) => (members[uid] ? clone(members[uid]) : null),
+    watchMembers: (cb) => watch(() => cb(clone(Object.values(members)))),
+    setMember: async (uid, patch) => { members[uid] = { ...members[uid], ...clone(patch), updatedAt: Date.now(), updatedBy: meUser.email }; emit(); },
+    watchInvites: (ownerUid, cb) => watch(() => cb(clone(Object.values(invites).filter((i) => !ownerUid || i.owner === ownerUid)))),
+    async createInvite(owner, ownerName) { const id = newToken(); invites[id] = { id, owner, ownerName, active: true, createdAt: Date.now() }; emit(); return id; },
+    setInvite: async (token, patch) => { Object.assign(invites[token], patch); emit(); },
+    watchRefs: (cb) => watch(() => cb(clone(Object.values(refs)))),
+    async createRef(id, data) {
+      if (refs[id]) throw Object.assign(new Error('ref taken'), { code: 'ref-taken' });
+      refs[id] = { id, ...data, active: true, leads: 0, createdAt: Date.now() }; emit();
+    },
+    updateRef: async (id, patch) => { Object.assign(refs[id], patch); emit(); },
+    watchRegistrations: (cb) => watch(() => cb(clone(Object.values(registrations).sort((a, b) => b.createdAt - a.createdAt)))),
+    updateRegistration: async (id, patch) => { Object.assign(registrations[id], patch); emit(); },
     daysInRange: async (root, uid, from, to) => days(root, uid, from, to),
     watchDaysInRange: (root, uid, from, to, cb) => watch(() => cb(days(root, uid, from, to))),
     getDeliveries: async (root, uid, key) => clone(store[root][uid]?.days[key]?.deliveries || []),
