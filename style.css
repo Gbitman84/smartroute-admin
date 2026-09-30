@@ -247,3 +247,6 @@ a.who:hover b { text-decoration: underline; }
 .reg-status.rejected { color: var(--muted); }
 .reg-row.new td:first-child { box-shadow: inset -3px 0 0 #dc2626; }
 .reg-row.rejected td { opacity: .6; }
+.check { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.check input { width: 18px; height: 18px; }
+.profile-actions { display: flex; flex-direction: column; gap: 8px; }

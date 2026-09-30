@@ -48,6 +48,34 @@ async function firebaseBackend() {
     watchMembers: (cb, onErr) => fs.onSnapshot(fs.collection(db, 'members'), (s) => cb(list(s)), onErr),
     setMember: (uid, patch) => fs.updateDoc(fs.doc(db, 'members', uid), { ...patch, updatedAt: Date.now(), updatedBy: me?.email || '' }),
 
+    // Superadmin only: remove a user – membership, refs, magic links off, and (withData) all their work data.
+    // Their Google sign-in stays, but without a member doc they get "user doesn't exist".
+    async deleteUser(root, uid, { withData = true, onProgress = () => {} } = {}) {
+      const refs = [];
+      const del = (ref) => refs.push(ref);
+      const docsOf = async (...path) => (await fs.getDocs(fs.collection(db, ...path))).docs.map((d) => d.ref);
+      (await fs.getDocs(fs.query(fs.collection(db, 'refs'), fs.where('owner', '==', uid)))).docs.forEach((d) => del(d.ref));
+      const invites = (await fs.getDocs(fs.query(fs.collection(db, 'invites'), fs.where('owner', '==', uid)))).docs;
+      if (withData) {
+        onProgress('אוסף נתונים…');
+        for (const day of await docsOf(root, uid, 'days')) {
+          (await docsOf(root, uid, 'days', day.id, 'deliveries')).forEach(del);
+          del(day);
+        }
+        for (const sub of ['meta', 'geocache', 'imports']) (await docsOf(root, uid, sub)).forEach(del);
+        del(fs.doc(db, root, uid));
+      }
+      del(fs.doc(db, 'members', uid)); // last, so a failure half-way leaves the user visible and retryable
+      for (let i = 0; i < refs.length; i += 400) {
+        onProgress(`מוחק ${Math.min(i + 400, refs.length)}/${refs.length}…`);
+        const b = fs.writeBatch(db);
+        refs.slice(i, i + 400).forEach((r) => b.delete(r));
+        if (i + 400 >= refs.length) invites.forEach((d) => b.update(d.ref, { active: false, deactivatedAt: Date.now() }));
+        await b.commit();
+      }
+      return refs.length;
+    },
+
     // Magic links: invites/{token}. ownerUid → only that owner's links (regular admins), null → all.
     watchInvites: (ownerUid, cb, onErr) => fs.onSnapshot(
       ownerUid ? fs.query(fs.collection(db, 'invites'), fs.where('owner', '==', ownerUid)) : fs.collection(db, 'invites'),
@@ -220,6 +248,14 @@ function demoBackend() {
     getMember: async (uid) => (members[uid] ? clone(members[uid]) : null),
     watchMembers: (cb) => watch(() => cb(clone(Object.values(members)))),
     setMember: async (uid, patch) => { members[uid] = { ...members[uid], ...clone(patch), updatedAt: Date.now(), updatedBy: meUser.email }; emit(); },
+    async deleteUser(root, uid, { withData = true } = {}) {
+      delete members[uid];
+      Object.keys(refs).forEach((k) => { if (refs[k].owner === uid) delete refs[k]; });
+      Object.values(invites).forEach((i) => { if (i.owner === uid) i.active = false; });
+      if (withData) delete store[root][uid];
+      emit();
+      return 1;
+    },
     watchInvites: (ownerUid, cb) => watch(() => cb(clone(Object.values(invites).filter((i) => !ownerUid || i.owner === ownerUid)))),
     async createInvite(owner, ownerName) { const id = newToken(); invites[id] = { id, owner, ownerName, active: true, createdAt: Date.now() }; emit(); return id; },
     setInvite: async (token, patch) => { Object.assign(invites[token], patch); emit(); },

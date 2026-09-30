@@ -101,6 +101,45 @@ async function toggleAccess(u) {
   } catch (e) { toast(explainError(e), { err: true, ms: 8000 }); }
 }
 
+// Superadmin only: delete a user (never yourself / the superadmin). Typed confirmation required.
+const canDelete = (uid) => isSuper() && uid !== A.me.uid && roleOf(uid) !== 'super';
+function deleteUser(u) {
+  if (!canDelete(u.id)) return;
+  const name = u.name || u.email || u.id;
+  const WORD = 'מחק';
+  const withData = el('input', { type: 'checkbox' });
+  withData.checked = true;
+  const word = el('input', { placeholder: `הקלד "${WORD}"`, autocomplete: 'off' });
+  const ok = el('button', { class: 'btn danger', type: 'button', disabled: true }, '🗑 מחק לצמיתות');
+  const status = el('p', { class: 'muted small' });
+  const close = () => box.remove();
+  const box = el('div', { class: 'overlay' }, el('div', { class: 'dialog', role: 'dialog' },
+    el('h2', {}, `למחוק את ${name}?`),
+    el('p', {}, 'המשתמש יוסר מ-SmartRoute: לא יוכל להיכנס ("המשתמש לא קיים") עד שיקבל קישור הזמנה חדש. קודי ההפניה שלו יימחקו וקישורי ההזמנה שלו יכובו.'),
+    el('label', { class: 'check' }, withData, ' מחק גם את כל נתוני העבודה שלו (ימים, משלוחים, הגדרות, פרופיל)'),
+    el('p', { class: 'error small' }, 'הפעולה לא ניתנת לביטול.'),
+    el('label', { class: 'field' }, `לאישור הקלד: ${WORD}`, word),
+    status,
+    el('div', { class: 'dialog-actions' }, ok, el('button', { class: 'btn', type: 'button', onclick: close }, 'ביטול'))));
+  word.addEventListener('input', () => (ok.disabled = word.value.trim() !== WORD));
+  box.addEventListener('click', (e) => { if (e.target === box && !ok.dataset.busy) close(); });
+  ok.addEventListener('click', async () => {
+    ok.disabled = true; ok.dataset.busy = '1';
+    try {
+      await A.data.deleteUser(A.app.root, u.id, { withData: withData.checked, onProgress: (t) => (status.textContent = t) });
+      close();
+      toast(`${name} נמחק`);
+      if (location.hash.startsWith('#/user/')) navigate('users');
+    } catch (e) {
+      status.textContent = '';
+      toast(explainError(e), { err: true, ms: 8000 });
+      ok.disabled = false; delete ok.dataset.busy;
+    }
+  });
+  document.body.append(box);
+  word.focus();
+}
+
 // Superadmin only: make someone an admin, or back to a regular user.
 async function changeRole(u, role) {
   if (!isSuper() || roleOf(u.id) === 'super' || !A.members[u.id]) return;
@@ -380,7 +419,8 @@ function viewUsers(main, id) {
           el('td', { class: 'num' }, leadsOf(u.id) || '—'),
           el('td', { class: 'actions' },
             el('a', { class: 'btn small', href: href('user', u.id, { p: 'day', d: todayStr() }) }, 'פרטים'),
-            canToggle(u.id) ? el('button', { class: 'btn small ' + (isDisabled(u.id) ? 'primary' : 'danger-outline'), type: 'button', onclick: () => toggleAccess(u) }, isDisabled(u.id) ? 'הפעל' : 'השבת') : null),
+            canToggle(u.id) ? el('button', { class: 'btn small ' + (isDisabled(u.id) ? 'primary' : 'danger-outline'), type: 'button', onclick: () => toggleAccess(u) }, isDisabled(u.id) ? 'הפעל' : 'השבת') : null,
+            canDelete(u.id) ? el('button', { class: 'btn small danger-outline', type: 'button', title: 'מחיקת משתמש', onclick: () => deleteUser(u) }, '🗑') : null),
         );
       })))));
   };
@@ -644,7 +684,8 @@ function viewUser(main, id, uid, per) {
           : el('span', { class: 'muted' }, 'אף אחד עדיין')),
         isDisabled(uid) ? [el('dt', {}, 'הושבת'), el('dd', {}, `${fmtStamp(m.updatedAt)}${m.note ? ' · ' + m.note : ''}`)] : null),
       el('div', { class: 'profile-actions' },
-        canToggle(uid) ? el('button', { class: 'btn ' + (isDisabled(uid) ? 'primary' : 'danger-outline'), type: 'button', onclick: () => toggleAccess(u) }, isDisabled(uid) ? '✓ הפעל משתמש' : '⛔ השבת משתמש') : null),
+        canToggle(uid) ? el('button', { class: 'btn ' + (isDisabled(uid) ? 'primary' : 'danger-outline'), type: 'button', onclick: () => toggleAccess(u) }, isDisabled(uid) ? '✓ הפעל משתמש' : '⛔ השבת משתמש') : null,
+        canDelete(uid) ? el('button', { class: 'btn danger-outline', type: 'button', onclick: () => deleteUser(u) }, '🗑 מחק משתמש') : null),
       refsPanel(u),
     );
   };
