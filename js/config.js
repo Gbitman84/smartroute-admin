@@ -12,7 +12,7 @@ export const firebaseConfig = {
 // SUPERADMIN – the only account that can make admins. Must match isSuper() in firestore.rules.
 export const SUPERADMIN = 'gbitman.bd@gmail.com';
 
-// The app this panel manages: SmartRoute (data under labUsers/{uid}). SmartRun (users/{uid}) is archived.
+// The app this panel manages: SmartRoute (data under labUsers/{uid}).
 export const APP = { name: 'SmartRoute', root: 'labUsers', url: 'https://gbitman84.github.io/smartroute/' };
 
 // Daily limits per role for the SmartRoute Cloud Functions (config/limits). Must match DEFAULT_LIMITS in

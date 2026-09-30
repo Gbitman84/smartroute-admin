@@ -1,6 +1,6 @@
 # SmartRoute Admin – פאנל ניהול
 
-אתר סטטי לניהול המשתמשים של **SmartRoute** (הנתונים ב-`labUsers/{uid}`), באותו פרויקט Firebase (`smartrun-gbit`). **SmartRun** נשמר כארכיון ואינו מוצג כאן.
+אתר סטטי לניהול המשתמשים של **SmartRoute** (הנתונים ב-`labUsers/{uid}`), באותו פרויקט Firebase (`smartrun-gbit` – השם ההיסטורי של הפרויקט; SmartRun לא בשימוש ואין לו גישה לנתונים).
 
 | מסך | מה יש בו |
 |---|---|
@@ -41,7 +41,7 @@
 כל ההרשאות נאכפות ב-`firestore.rules`. הטופס הציבורי יכול רק ליצור פנייה, בשדות מאומתים.
 
 ## פריסה
-1. **כללי Firestore:** `firestore.rules` נמצא ב-SmartRoute (ועותק זהה ב-SmartRun). הפריסה מתיקיית `SmartRoute`:
+1. **כללי Firestore:** `firestore.rules` מנוהל רק ב-SmartRoute. הפריסה מתיקיית `SmartRoute` (לא מהתיקייה הישנה `SmartRun`):
    ```bash
    npx -y firebase-tools@latest deploy --only firestore:rules --project smartrun-gbit
    ```
