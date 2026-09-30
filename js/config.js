@@ -15,5 +15,14 @@ export const SUPERADMIN = 'gbitman.bd@gmail.com';
 // The app this panel manages: SmartRoute (data under labUsers/{uid}). SmartRun (users/{uid}) is archived.
 export const APP = { name: 'SmartRoute', root: 'labUsers', url: 'https://gbitman84.github.io/smartroute/' };
 
+// Daily limits per role for the SmartRoute Cloud Functions (config/limits). Must match DEFAULT_LIMITS in
+// SmartRoute/functions/access.js – used until the superadmin saves their own values. Empty = no role cap.
+export const LIMIT_KINDS = [['routeOpt', 'בניית מסלול חכם (Google) ביום', 'routeopt', 'requests'], ['scanReads', 'קריאת צילומים ביום', 'extract', 'reads']];
+export const DEFAULT_LIMITS = {
+  roles: { super: { routeOpt: 40, scanReads: 120 }, admin: { routeOpt: 40, scanReads: 120 }, user: { routeOpt: 40, scanReads: 120 } },
+  global: { routeOpt: 40, scanReads: 120 },
+};
+export const ROLE_LABELS = { super: '⭐ מנהל ראשי', admin: '👑 מנהל', user: 'משתמש' };
+
 export const magicLink = (token) => `${APP.url}?invite=${token}`;
 export const registrationLink = (ref) => `${APP.url}Registration?ref=${encodeURIComponent(ref)}`;

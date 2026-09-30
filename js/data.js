@@ -20,6 +20,13 @@ async function firebaseBackend() {
   const app = initializeApp(firebaseConfig, 'smartroute-admin');
   const a = auth.getAuth(app);
   const db = fs.getFirestore(app);
+  // ?emu=1 → local Firebase emulators (tests only). Never set in real use.
+  if (new URLSearchParams(location.search).has('emu')) {
+    auth.connectAuthEmulator(a, 'http://127.0.0.1:9099', { disableWarnings: true });
+    fs.connectFirestoreEmulator(db, '127.0.0.1', 8080);
+    // Test hook: sign in a seeded emulator test account (SmartRoute/tests/seed.mjs) without the Google popup.
+    window.__emuSignIn = (email, password) => auth.signInWithEmailAndPassword(a, email, password);
+  }
   let me = null;
   const list = (snap) => snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
@@ -98,6 +105,11 @@ async function firebaseBackend() {
     },
     updateRef: (id, patch) => fs.updateDoc(fs.doc(db, 'refs', id), patch),
 
+    // Daily limits per role (config/limits, superadmin writes) and today's usage (quota/<kind>-<day>, functions write).
+    watchLimits: (cb, onErr) => fs.onSnapshot(fs.doc(db, 'config', 'limits'), (s) => cb(s.exists() ? s.data() : null), onErr),
+    setLimits: (data) => fs.setDoc(fs.doc(db, 'config', 'limits'), { ...data, updatedAt: Date.now(), updatedBy: me?.email || '' }),
+    async getQuota(docId) { const s = await fs.getDoc(fs.doc(db, 'quota', docId)); return s.exists() ? s.data() : null; },
+
     // Registration requests from the public form (newest first).
     watchRegistrations: (cb, onErr) => fs.onSnapshot(
       fs.query(fs.collection(db, 'registrations'), fs.orderBy('createdAt', 'desc'), fs.limit(500)),
@@ -132,8 +144,11 @@ function demoBackend() {
 
   const store = { labUsers: {} };        // root → uid → { profile, days: { key: { doc, deliveries } } }
   // Members, magic links, refs and registrations. "sa" is the superadmin; u2 is an admin.
-  const asAdmin = new URLSearchParams(location.search).get('as') === 'admin';
-  const meUser = asAdmin ? { uid: 'u2', name: 'מיכל לוי', email: 'michal.l@example.com' } : { uid: 'sa', name: 'Gil (superadmin)', email: 'gbitman.bd@gmail.com' };
+  const as = new URLSearchParams(location.search).get('as'); // admin | user → view as that role
+  const meUser = as === 'admin' ? { uid: 'u2', name: 'מיכל לוי', email: 'michal.l@example.com' }
+    : as === 'user' ? { uid: 'u1', name: 'יוסי כהן', email: 'yossi.courier@example.com' }
+      : { uid: 'sa', name: 'Gil (superadmin)', email: 'gbitman.bd@gmail.com' };
+  let authCb = null;
   const mem = (id, o) => ({ id, uid: id, role: 'user', disabled: false, joinedAt: now - 30 * 24 * H, refSuffix: 'x' + id.padEnd(5, '0').slice(0, 5), ...o });
   const members = {
     sa: mem('sa', { name: 'Gil', email: 'gbitman.bd@gmail.com', invitedBy: 'superadmin', refSuffix: 'd87d32', primaryRef: 'gil-d87d32', joinedAt: now - 90 * 24 * H }),
@@ -146,6 +161,7 @@ function demoBackend() {
     SaToken000000000000001: { id: 'SaToken000000000000001', owner: 'sa', ownerName: 'Gil', active: true, createdAt: now - 90 * 24 * H },
     U2Token000000000000001: { id: 'U2Token000000000000001', owner: 'u2', ownerName: 'מיכל לוי', active: true, createdAt: now - 30 * 24 * H },
   };
+  let limits = null; // config/limits – null until the superadmin saves (the panel shows the defaults)
   const refs = {};
   const addRef = (id, owner, kind, label = '', leads = 0, active = true) => (refs[id] = { id, owner, kind, label, leads, active, createdAt: now - 20 * 24 * H });
   addRef('gbitman.bd-d87d32', 'sa', 'email'); addRef('gil-d87d32', 'sa', 'name', '', 3); addRef('gil-fb-a', 'sa', 'custom', 'Facebook A', 2); addRef('gil-fb-b', 'sa', 'custom', 'Facebook B', 1);
@@ -242,8 +258,8 @@ function demoBackend() {
   const days = (root, uid, from, to) => Object.values(store[root][uid]?.days || {}).map((x) => clone(x.doc)).filter((d) => d.date >= from && d.date <= to);
   return {
     mode: 'demo',
-    onAuth(cb) { setTimeout(() => cb({ ...meUser }), 0); return () => {}; },
-    signIn: async () => {}, signOut: async () => { location.search = ''; },
+    onAuth(cb) { authCb = cb; setTimeout(() => cb({ ...meUser }), 0); return () => {}; },
+    signIn: async () => { authCb?.({ ...meUser }); }, signOut: async () => { setTimeout(() => authCb?.(null), 0); },
     watchUsers: (root, cb) => watch(() => cb(Object.values(store[root]).map((u) => clone(u.profile)))),
     getMember: async (uid) => (members[uid] ? clone(members[uid]) : null),
     watchMembers: (cb) => watch(() => cb(clone(Object.values(members)))),
@@ -265,6 +281,9 @@ function demoBackend() {
       refs[id] = { id, ...data, active: true, leads: 0, createdAt: Date.now() }; emit();
     },
     updateRef: async (id, patch) => { Object.assign(refs[id], patch); emit(); },
+    watchLimits: (cb) => watch(() => cb(limits ? clone(limits) : null)),
+    setLimits: async (data) => { limits = { ...clone(data), updatedAt: Date.now(), updatedBy: meUser.email }; emit(); },
+    getQuota: async (docId) => (docId.startsWith('routeopt') ? { requests: 5, users: { u1: 3, u2: 2 }, roles: { user: 3, admin: 2 } } : { reads: 14, users: { sa: 14 }, roles: { super: 14 } }),
     watchRegistrations: (cb) => watch(() => cb(clone(Object.values(registrations).sort((a, b) => b.createdAt - a.createdAt)))),
     updateRegistration: async (id, patch) => { Object.assign(registrations[id], patch); emit(); },
     daysInRange: async (root, uid, from, to) => days(root, uid, from, to),

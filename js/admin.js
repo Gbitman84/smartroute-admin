@@ -1,5 +1,5 @@
 import { createData, statsOf } from './data.js';
-import { SUPERADMIN, APP, magicLink, registrationLink } from './config.js';
+import { SUPERADMIN, APP, magicLink, registrationLink, LIMIT_KINDS, DEFAULT_LIMITS, ROLE_LABELS } from './config.js';
 import {
   $, el, esc, todayStr, addDays, parseDate, dayName, shortDate, longDate, periodRange, stepPeriod, periodLabel, eachDay,
   fmtTime, fmtStamp, fmtAgo, fmtDuration, fmtAddress, pct, initials, decodePolyline,
@@ -181,12 +181,27 @@ function sumStats(list) {
 }
 
 // Per-date stats (all versions of a date summed) for one user.
-async function userPeriod(uid, from, to) {
+// Per-date stats of one user for [from, to]. Days before today hardly change, so they are read once per
+// session (pastCache); refreshes only re-read today. Reload the page to force a full re-read.
+const pastCache = new Map();
+async function readDays(uid, from, to) {
   const docs = await A.data.daysInRange(A.app.root, uid, from, to);
+  A.reads = (A.reads || 0) + Math.max(1, docs.length); // rough read counter (shown in the console for tests)
   const stats = await Promise.all(docs.map((d) => docStats(uid, d)));
   const byDate = {};
   docs.forEach((d, i) => (byDate[d.date] ||= []).push(stats[i]));
-  const days = Object.fromEntries(Object.entries(byDate).map(([date, l]) => [date, sumStats(l)]));
+  return Object.fromEntries(Object.entries(byDate).map(([date, l]) => [date, sumStats(l)]));
+}
+async function userPeriod(uid, from, to) {
+  const t = todayStr(), y = addDays(t, -1);
+  const parts = [];
+  if (from <= y) {
+    const key = `${A.app.root}|${uid}|${from}|${to < y ? to : y}`;
+    if (!pastCache.has(key)) pastCache.set(key, readDays(uid, from, to < y ? to : y).catch((e) => { pastCache.delete(key); throw e; }));
+    parts.push(pastCache.get(key));
+  }
+  if (from <= t && t <= to) parts.push(readDays(uid, t, t));
+  const days = Object.assign({}, ...(await Promise.all(parts)));
   const worked = Object.values(days).filter((s) => s.total > 0);
   return { days, total: sumStats(worked), workDays: worked.length };
 }
@@ -284,7 +299,7 @@ function parseRoute() {
   const q = new URLSearchParams(qs || '');
   const per = { p: ['day', 'week', 'month'].includes(q.get('p')) ? q.get('p') : 'day', d: /^\d{4}-\d{2}-\d{2}$/.test(q.get('d') || '') ? q.get('d') : todayStr() };
   const [name, arg] = (path || 'overview').split('/');
-  return { name: ['overview', 'users', 'user', 'links', 'registrations'].includes(name) ? name : 'overview', arg: arg ? decodeURIComponent(arg) : null, per };
+  return { name: ['overview', 'users', 'user', 'links', 'registrations', 'settings'].includes(name) ? name : 'overview', arg: arg ? decodeURIComponent(arg) : null, per };
 }
 const href = (name, arg, per) => `#/${name}${arg ? '/' + encodeURIComponent(arg) : ''}${per ? `?p=${per.p}&d=${per.d}` : ''}`;
 const navigate = (name, arg, per) => { location.hash = href(name, arg, per); };
@@ -310,14 +325,21 @@ function route() {
   else if (r.name === 'user' && r.arg) viewUser(main, id, r.arg, r.per);
   else if (r.name === 'links') viewLinks(main, id);
   else if (r.name === 'registrations') viewRegistrations(main, id);
+  else if (r.name === 'settings') viewSettings(main, id);
   else viewOverview(main, id, r.per);
 }
 
 // Today's view refreshes itself every minute (the apps write stats as the courier works).
-function autoRefresh(per, fn) {
+function autoRefresh(per, fn, ms = 60000) {
   const { from, to } = periodRange(per);
   const t = todayStr();
-  if (from <= t && t <= to) A.view.timer = setInterval(fn, 60000);
+  if (from <= t && t <= to) A.view.timer = setInterval(fn, ms);
+}
+// Reload only when the list of users changes – not on every profile update (last location / last seen).
+const usersSig = () => A.users.map((u) => u.id).sort().join(",");
+function onUserListChange(fn) {
+  let sig = usersSig();
+  return () => { const s = usersSig(); if (s !== sig) { sig = s; fn(); } };
 }
 
 // ------------------------------------------------------------------ overview
@@ -375,8 +397,8 @@ function viewOverview(main, id, per) {
       : el('p', { class: 'muted pad' }, A.usersLoaded ? 'אין עדיין משתמשים. משתמש מופיע כאן אחרי שהוא נכנס לאפליקציה (בגרסה המעודכנת).' : 'טוען…'));
   };
   load();
-  A.view.onUsers = load;
-  autoRefresh(per, load);
+  A.view.onUsers = onUserListChange(load);
+  autoRefresh(per, load, 120000);
 }
 
 // ------------------------------------------------------------------ users
@@ -433,8 +455,9 @@ function viewUsers(main, id) {
   search.addEventListener('input', () => { f.q = search.value; draw(); });
   draw();
   loadToday();
-  A.view.onUsers = () => { draw(); loadToday(); };
-  A.view.timer = setInterval(loadToday, 60000);
+  const reloadToday = onUserListChange(loadToday);
+  A.view.onUsers = () => { draw(); reloadToday(); };
+  A.view.timer = setInterval(loadToday, 120000);
 }
 
 // ------------------------------------------------------------------ referral codes (refs) of a user
@@ -613,6 +636,9 @@ function viewRegistrations(main, id) {
     const fn = REG_FILTERS.find(([k]) => k === f.status)?.[2] || (() => true);
     const q = f.q.trim().toLowerCase();
     const rows = A.regs.filter(fn).filter((r) => !q || `${r.name} ${r.mobile} ${r.ref}`.toLowerCase().includes(q));
+    // The same mobile number registered more than once (all requests, any status).
+    const perMobile = {};
+    A.regs.forEach((r) => (perMobile[r.mobile] = (perMobile[r.mobile] || 0) + 1));
     if (!rows.length) { list.replaceChildren(el('p', { class: 'muted pad' }, A.regs.length ? 'אין פניות בסינון הזה.' : 'אין עדיין פניות. קישור הטופס: ' + APP.url + 'Registration')); return; }
     list.replaceChildren(el('div', { class: 'tbl-wrap' }, el('table', { class: 'tbl' },
       el('thead', {}, el('tr', {}, ['מתי', 'שם', 'טלפון', 'Ref / הופנה ע״י', 'מקור', 'סטטוס', ''].map((h) => el('th', {}, h)))),
@@ -629,7 +655,8 @@ function viewRegistrations(main, id) {
         };
         return el('tr', { class: 'reg-row ' + st.cls },
           el('td', { class: 'small', title: fmtStamp(r.createdAt) }, fmtAgo(r.createdAt), el('div', { class: 'muted' }, fmtStamp(r.createdAt).slice(0, 10))),
-          el('td', {}, el('b', {}, r.name), r.note ? el('div', { class: 'muted small' }, '📝 ' + r.note) : null),
+          el('td', {}, el('b', {}, r.name), perMobile[r.mobile] > 1 ? el('span', { class: 'chip dup', title: `המספר נרשם ${perMobile[r.mobile]} פעמים` }, `כפול ×${perMobile[r.mobile]}`) : null,
+            r.note ? el('div', { class: 'muted small' }, '📝 ' + r.note) : null),
           el('td', {}, el('a', { class: 'mono', href: 'tel:' + r.mobile }, r.mobile)),
           el('td', {}, refCell(r)),
           el('td', { class: 'small' }, r.source === 'link' ? 'קישור' : 'ידני'),
@@ -650,6 +677,75 @@ function viewRegistrations(main, id) {
   draw();
   A.view.onData = draw;
   A.view.onUsers = draw;
+}
+
+// ------------------------------------------------------------------ settings: daily limits per role
+// config/limits → read by the SmartRoute Cloud Functions. Superadmin edits; admins see it read-only.
+// Roles are whatever keys exist (future roles appear automatically); an empty field = no role cap.
+const israelDay = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
+
+function viewSettings(main, id) {
+  const box = el('div', { class: 'card' }, el('p', { class: 'muted pad' }, 'טוען…'));
+  main.append(el('div', { class: 'view-head' }, el('h1', {}, '⚙️ הגדרות – מגבלות יומיות לפי תפקיד')),
+    el('p', { class: 'muted' }, 'כמה פעמים ביום כל משתמש יכול להשתמש בשירותים בתשלום של SmartRoute. המגבלה נספרת לכל משתמש לפי התפקיד שלו, והמכסה הכללית חלה על כולם יחד. שדה ריק = ללא מגבלה לתפקיד (רק המכסה הכללית). 0 = חסום.'),
+    box);
+  let limits = null, usage = {}, loaded = false;
+  const editable = isSuper();
+
+  const draw = () => {
+    if (id !== A.view.id) return;
+    if (!loaded) return;
+    const L = limits?.roles ? limits : DEFAULT_LIMITS;
+    const roles = [...new Set(['super', 'admin', 'user', ...Object.keys(L.roles || {})])];
+    const inputs = {};
+    const cell = (key, kind, value) => {
+      if (!editable) return el('td', { class: 'num' }, value === '' || value == null ? 'ללא' : value);
+      const inp = el('input', { type: 'number', min: '0', step: '1', inputmode: 'numeric', class: 'limit-in', value: value ?? '', placeholder: 'ללא' });
+      (inputs[key] ||= {})[kind] = inp;
+      return el('td', { class: 'num' }, inp);
+    };
+    const used = (kind, role) => {
+      const q = usage[kind] || {};
+      return role ? q.roles?.[role] || 0 : q[LIMIT_KINDS.find(([k]) => k === kind)[3]] || 0;
+    };
+    const rows = [
+      ...roles.map((r) => el('tr', {},
+        el('td', {}, el('b', {}, ROLE_LABELS[r] || r)),
+        ...LIMIT_KINDS.flatMap(([k]) => [cell(r, k, L.roles?.[r]?.[k]), el('td', { class: 'num muted small' }, used(k, r))]))),
+      el('tr', { class: 'total-row' },
+        el('td', {}, el('b', {}, '🌐 מכסה כללית (כל המשתמשים יחד)')),
+        ...LIMIT_KINDS.flatMap(([k]) => [cell('global', k, L.global?.[k]), el('td', { class: 'num muted small' }, used(k))])),
+    ];
+    const save = el('button', { class: 'btn primary', type: 'button' }, '💾 שמור');
+    save.addEventListener('click', async () => {
+      const val = (inp) => (inp.value.trim() === '' ? '' : Math.max(0, Math.floor(+inp.value)));
+      const next = { roles: {}, global: {} };
+      for (const r of roles) next.roles[r] = Object.fromEntries(LIMIT_KINDS.map(([k]) => [k, val(inputs[r][k])]));
+      next.global = Object.fromEntries(LIMIT_KINDS.map(([k]) => [k, val(inputs.global[k])]));
+      save.disabled = true;
+      try { await A.data.setLimits(next); toast('המגבלות נשמרו ✓ (נכנסות לתוקף תוך כדקה)'); }
+      catch (e) { toast(explainError(e), { err: true, ms: 8000 }); }
+      save.disabled = false;
+    });
+    box.replaceChildren(
+      el('div', { class: 'tbl-wrap' }, el('table', { class: 'tbl limits' },
+        el('thead', {}, el('tr', {}, el('th', {}, 'תפקיד'), ...LIMIT_KINDS.flatMap(([, label]) => [el('th', { class: 'num' }, label), el('th', { class: 'num muted' }, 'היום')]))),
+        el('tbody', {}, rows))),
+      el('div', { class: 'pad settings-foot' },
+        editable ? save : el('span', { class: 'muted small' }, 'רק המנהל הראשי יכול לשנות את המגבלות.'),
+        el('span', { class: 'muted small' }, limits?.updatedAt ? ` עודכן ${fmtStamp(limits.updatedAt)} ע״י ${limits.updatedBy || '—'}` : ' עדיין לא נשמרו מגבלות – מוצגים ערכי ברירת המחדל.')),
+    );
+  };
+
+  const loadUsage = async () => {
+    const day = israelDay();
+    const res = await Promise.all(LIMIT_KINDS.map(([, , doc]) => A.data.getQuota(`${doc}-${day}`).catch(() => null)));
+    LIMIT_KINDS.forEach(([k], i) => (usage[k] = res[i] || {}));
+    draw();
+  };
+  A.view.unsubs.push(A.data.watchLimits((l) => { limits = l; loaded = true; draw(); }, (e) => box.replaceChildren(el('p', { class: 'error pad' }, explainError(e)))));
+  loadUsage();
+  A.view.timer = setInterval(loadUsage, 120000);
 }
 
 // ------------------------------------------------------------------ user detail
@@ -920,7 +1016,16 @@ function updateBadge() {
 function listenAll() {
   A.listeners.forEach((u) => u());
   Object.assign(A, { users: [], profiles: [], members: {}, invites: [], refs: {}, regs: [], usersLoaded: false, profilesLoaded: false, membersLoaded: false, invitesLoaded: false, regsLoaded: false });
-  const onErr = (e) => { $('#main').replaceChildren(el('div', { class: 'card' }, el('p', { class: 'error pad' }, explainError(e)))); };
+  const showErr = (e) => { $('#main').replaceChildren(el('div', { class: 'card' }, el('p', { class: 'error pad' }, explainError(e)))); };
+  // A demoted/disabled admin loses read access at once, so the listeners fail before the members
+  // snapshot can report the change → re-check our own membership and go back to the gate if so.
+  const onErr = async (e) => {
+    if (A.role === 'admin' && e?.code === 'permission-denied') {
+      const m = await A.data.getMember(A.me.uid).catch(() => undefined);
+      if (m !== undefined && (m?.role !== 'admin' || m.disabled)) { location.reload(); return; }
+    }
+    showErr(e);
+  };
   const usersChanged = () => { mergeUsers(); A.view.onUsers?.(); };
   A.listeners = [
     A.data.watchUsers(A.app.root, (p) => { A.profiles = p; A.profilesLoaded = true; usersChanged(); }, onErr),
@@ -949,7 +1054,7 @@ async function boot() {
 
   const signIn = async () => { $('#loginErr').textContent = ''; try { await A.data.signIn(); } catch (e) { $('#loginErr').textContent = e.message; } };
   $('#loginBtn').addEventListener('click', signIn);
-  $('#switchBtn').addEventListener('click', async () => { await A.data.signOut(); signIn(); });
+  $('#switchBtn').addEventListener('click', () => signIn());
   $('#logoutBtn').addEventListener('click', () => A.data.signOut());
   window.addEventListener('hashchange', route);
 
@@ -957,7 +1062,12 @@ async function boot() {
   A.data.onAuth(async (user) => {
     A.me = user;
     A.role = null;
-    if (!user) { A.listeners.forEach((u) => u()); A.listeners = []; clearView(); showScreen('login'); return; }
+    if (!user) {
+      A.listeners.forEach((u) => u()); A.listeners = []; clearView();
+      if (A.denied != null) { $('#deniedEmail').textContent = A.denied; A.denied = null; showScreen('denied'); }
+      else showScreen('login');
+      return;
+    }
     showScreen('loading');
     let role = null;
     if (String(user.email || '').toLowerCase() === SUPERADMIN) role = 'super';
@@ -966,7 +1076,8 @@ async function boot() {
       if (m?.role === 'admin' && !m.disabled) role = 'admin';
     }
     if (A.me !== user) return;
-    if (!role) { $('#deniedEmail').textContent = user.email; showScreen('denied'); return; }
+    // Not an admin: same answer as a non-existent user, and the session ends right away.
+    if (!role) { A.denied = user.email || ''; A.data.signOut(); return; }
     A.role = role;
     $('#meBox').replaceChildren(avatar(user, 28), el('span', { class: 'me-email' }, user.email),
       el('span', { class: 'chip role ' + (role === 'super' ? 'super' : 'admin') }, role === 'super' ? '⭐ מנהל ראשי' : '👑 מנהל'));
